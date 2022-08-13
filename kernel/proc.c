@@ -121,6 +121,26 @@ found:
     return 0;
   }
 
+  //add for Lab3
+  // An empty kernel page table.
+  p->kernelPt = ukvminit();
+  if(p->kernelPt == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  //initialize kernel stack
+  char *pa = kalloc();
+  if (pa == 0)
+  {
+    panic("kalloc");
+  }
+  uint64 va = KSTACK((int)(p - proc));
+  ukvmmap(p->kernelPt, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+  p->kstack = va;
+  // end
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -139,8 +159,25 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+  //delete kstack(add for Lab3)
+  if (p->kstack)
+  {
+    pte_t *pte = walk(p->kernelPt, p->kstack, 0);
+    if (pte == 0)
+    {
+      panic("freeproc: walk");
+    }
+    kfree((void *)PTE2PA(*pte));
+    p->kstack = 0;
+  }
+
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
+  //add for Lab3
+  if(p->kernelPt)
+    proc_freekpt(p->kernelPt);
+
+  p->kernelPt=0;
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -195,6 +232,26 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
   uvmfree(pagetable, sz);
 }
 
+// add for Lab3
+// Free a kernel page table,
+void proc_freekpt(pagetable_t pagetable)
+{
+  for (int i = 0; i < 512; i++)
+  {
+    pte_t pte = pagetable[i];
+    if (pte & PTE_V)
+    {
+      pagetable[i] = 0;
+      if ((pte & (PTE_R | PTE_W | PTE_X)) == 0)
+      {
+        uint64 child = PTE2PA(pte);
+        proc_freekpt((pagetable_t)child);
+      }
+    }
+  }
+  kfree((void *)pagetable);
+}
+
 // a user program that calls exec("/init")
 // od -t xC initcode
 uchar initcode[] = {
@@ -220,6 +277,7 @@ userinit(void)
   // and data into it.
   uvminit(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
+  u2kvmcopy(p->pagetable, p->kernelPt, 0, p->sz);
 
   // prepare for the very first "return" from kernel to user.
   p->trapframe->epc = 0;      // user program counter
@@ -243,9 +301,17 @@ growproc(int n)
 
   sz = p->sz;
   if(n > 0){
+    //add for Lab3
+    if (PGROUNDUP(sz + n) >= PLIC)
+      return -1;
+
     if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
       return -1;
     }
+
+    //add for Lab3
+    u2kvmcopy(p->pagetable, p->kernelPt, sz-n, sz);
+
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
@@ -288,6 +354,9 @@ fork(void)
     if(p->ofile[i])
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
+
+  //add for Lab3
+  u2kvmcopy(np->pagetable, np->kernelPt, 0, np->sz);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
@@ -473,7 +542,16 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        //add for Lab3
+        //change satp
+        w_satp(MAKE_SATP(p->kernelPt));
+        sfence_vma();
+
+        //change process
         swtch(&c->context, &p->context);
+
+        //change back
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
